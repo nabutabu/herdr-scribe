@@ -17,7 +17,7 @@ func SocketPath() string {
 }
 
 func Call(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
-	conn, err := net.Dial("unix", SocketPath())
+	conn, err := Dial()
 	if err != nil {
 		return nil, fmt.Errorf("dialing unix socket %s: %w", SocketPath(), err)
 	}
@@ -52,4 +52,8 @@ func Call(ctx context.Context, method string, params map[string]any) (json.RawMe
 	}
 
 	return resp.Result, nil
+}
+
+func Dial() (net.Conn, error) {
+	return net.Dial("unix", SocketPath())
 }

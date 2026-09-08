@@ -10,6 +10,11 @@ Implemented so far:
 - **1.1 — Minimal socket connection + `ping`.** A reusable, one-shot
   newline-delimited JSON RPC client over the Herdr Unix socket, exercised by a
   tiny `ping` demo binary.
+- **1.5 — Subscription on its own dedicated connection.** A `Subscriber` that
+  opens a fresh connection exclusively for `events.subscribe`, owns it with a
+  dedicated reader task, and logs every pushed event verbatim. The connection
+  is write-once by design: RPCs must open their own short-lived connection
+  (`client.Call`) and can never reuse this one.
 
 ## Requirements
 
@@ -48,11 +53,16 @@ instance.
 ## Layout
 
 ```
-main.go                      # ping demo binary
+main.go                      # ping + events.subscribe demo binary
 internal/client/             # low-level NDJSON RPC client over the Unix socket
-  client.go                  # one-shot Call helper, socket path resolution
+  client.go                  # one-shot Call helper, Dial, socket path resolution
   rpc.go                     # wire types, frame encode/decode
   client_test.go             # framing + end-to-end tests against a stub server
+internal/events/             # scoped event subscription payload + long-lived subscriber
+  subscription.go            # event names, BuildParams subscription payload
+  subscription_test.go       # BuildParams tests
+  subscriber.go              # dedicated-connection Subscriber with verbatim event logging
+  subscriber_test.go         # subscriber tests against a stub server
 PLAN.md                      # full multi-phase implementation plan
 ```
 
