@@ -2,7 +2,6 @@ package events
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,7 +19,7 @@ import (
 // never reuse this one.
 type Subscriber struct {
 	conn   net.Conn
-	events chan json.RawMessage
+	events chan NormalizedEvent
 	err    chan error
 	done   chan struct{}
 
@@ -49,7 +48,7 @@ func NewSubscriber(params map[string]any) (*Subscriber, error) {
 
 	s := &Subscriber{
 		conn:   conn,
-		events: make(chan json.RawMessage, 64),
+		events: make(chan NormalizedEvent, 64),
 		err:    make(chan error, 1),
 		done:   make(chan struct{}),
 	}
@@ -59,7 +58,7 @@ func NewSubscriber(params map[string]any) (*Subscriber, error) {
 }
 
 // Events delivers each pushed event verbatim, exactly as received on the wire.
-func (s *Subscriber) Events() <-chan json.RawMessage { return s.events }
+func (s *Subscriber) Events() <-chan NormalizedEvent { return s.events }
 
 // Err reports a terminal stream failure (socket error or EOF).
 func (s *Subscriber) Err() <-chan error { return s.err }
@@ -98,50 +97,24 @@ func (s *Subscriber) run() {
 			return
 		}
 
-		switch classify(raw) {
+		kind, ev, err := parseFrame(raw)
+		if err != nil {
+			slog.Warn("unrecognized event; skipping", "raw", string(raw), "error", err)
+			continue
+		}
+
+		switch kind {
 		case frameEvent:
-			slog.Info("pushed event", "raw", string(raw))
+			slog.Debug("pushed event", "raw", string(raw))
 			select {
-			case s.events <- raw:
+			case s.events <- ev:
 			default:
 				slog.Warn("event channel full; dropping event", "raw", string(raw))
 			}
 		case frameAck:
-			slog.Debug("subscribe response", "raw", string(raw))
+			slog.Info("subscribe response", "raw", string(raw))
 		default:
 			slog.Warn("unrecognized frame; skipping", "raw", string(raw))
 		}
 	}
-}
-
-type frameKind int
-
-const (
-	frameUnknown frameKind = iota
-	frameEvent
-	frameAck
-)
-
-type frameHead struct {
-	ID     string          `json:"id"`
-	Result json.RawMessage `json:"result"`
-	Error  json.RawMessage `json:"error"`
-	Type   string          `json:"type"`
-}
-
-// classify distinguishes pushed events (have a "type" field) from the
-// subscribe ack/response envelope (has id/result/error) so the ack and
-// unknown frames never leak into the event stream.
-func classify(raw json.RawMessage) frameKind {
-	var head frameHead
-	if err := json.Unmarshal(raw, &head); err != nil {
-		return frameUnknown
-	}
-	if head.Type != "" {
-		return frameEvent
-	}
-	if head.ID != "" || head.Result != nil || head.Error != nil {
-		return frameAck
-	}
-	return frameUnknown
 }

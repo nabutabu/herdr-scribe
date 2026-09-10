@@ -15,6 +15,14 @@ Implemented so far:
   dedicated reader task, and logs every pushed event verbatim. The connection
   is write-once by design: RPCs must open their own short-lived connection
   (`client.Call`) and can never reuse this one.
+- **1.6 — Normalize pushed events into an internal type.** A stateless
+  `Normalize` maps each raw event into a `NormalizedEvent` (workspace
+  created/closed, pane created/closed, agent detected, agent status changed).
+  Only the confirmed wire fields are modeled — no sequence number, revision,
+  or display fields. `agent_status_changed` carries no previous state on the
+  wire, so it is supplied by a caller-provided lookup; unrecognized status
+  values degrade to `unknown`, and malformed/unknown events return an error
+  for the caller to log and skip.
 
 ## Requirements
 
@@ -63,6 +71,8 @@ internal/events/             # scoped event subscription payload + long-lived su
   subscription_test.go       # BuildParams tests
   subscriber.go              # dedicated-connection Subscriber with verbatim event logging
   subscriber_test.go         # subscriber tests against a stub server
+  event.go                   # NormalizedEvent + stateless Normalize mapping
+  event_test.go              # normalizer tests
 PLAN.md                      # full multi-phase implementation plan
 ```
 

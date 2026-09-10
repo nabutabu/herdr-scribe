@@ -47,10 +47,10 @@ func ReadFrame(reader *bufio.Reader) (json.RawMessage, error) {
 		return nil, err
 	}
 
-	return json.RawMessage(trimNewline(line)), nil
+	return json.RawMessage(TrimNewline(line)), nil
 }
 
-func trimNewline(line []byte) []byte {
+func TrimNewline(line []byte) []byte {
 	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
 		line = line[:len(line)-1]
 	}

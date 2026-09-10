@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nabutabu/herdr-scribe/internal/client"
+	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 )
 
 func TestMain(m *testing.M) {
@@ -161,12 +162,47 @@ func TestSubscribePaneScopedParams(t *testing.T) {
 	}
 }
 
-func TestSubscribeReceivesEventsVerbatim(t *testing.T) {
-	events := []string{
-		`{"type":"workspace.created","workspace_id":"w1","number":1,"label":"~"}`,
-		`{"type":"pane.created","pane_id":"w1:p1","workspace_id":"w1","tab_id":"w1:t1"}`,
-		`{"type":"pane.agent_detected","agent":"codex","pane_id":"w1:p1","workspace_id":"w1"}`,
-		`{"type":"pane.agent_status_changed","agent":"codex","agent_status":"working","pane_id":"w1:p1","workspace_id":"w1"}`,
+func TestSubscribeDeliversNormalizedEvents(t *testing.T) {
+	events := []struct {
+		raw   string
+		kind  Kind
+		pane  string
+		tab   string
+		agent string
+		state snapshot.AgentStatus
+	}{
+		{
+			raw:   `{"data":{"type":"workspace_created","workspace":{"active_tab_id":"wS:t1","agent_status":"unknown","focused":true,"label":"herdr-scribe","number":2,"pane_count":1,"tab_count":1,"workspace_id":"wS"}},"event":"workspace_created"}`,
+			kind:  KindWorkspaceCreated,
+			pane:  "",
+			tab:   "",
+			agent: "",
+			state: "",
+		},
+		{
+			raw:   `{"data":{"pane":{"pane_id":"w1:p1","workspace_id":"w1","tab_id":"w1:t1"},"type":"pane_created"},"event":"pane_created"}`,
+			kind:  KindPaneCreated,
+			pane:  "w1:p1",
+			tab:   "w1:t1",
+			agent: "",
+			state: "",
+		},
+		{
+			raw:   `{"data":{"agent":"codex","pane_id":"w1:p1","type":"pane_agent_detected","workspace_id":"w1"},"event":"pane_agent_detected"}`,
+			kind:  KindAgentDetected,
+			pane:  "w1:p1",
+			tab:   "",
+			agent: "codex",
+			state: "",
+		},
+		{
+			raw:   `{"data":{"agent":"codex","agent_status":"working","pane_id":"w1:p1","workspace_id":"w1"},"event":"pane.agent_status_changed"}`,
+			kind:  KindAgentStatusChanged,
+			pane:  "w1:p1",
+			tab:   "",
+			agent: "codex",
+			state: snapshot.AgentStatusWorking,
+		},
 	}
 
 	sock, _ := startStubServer(t, func(r *bufio.Reader, conn net.Conn) error {
@@ -174,7 +210,7 @@ func TestSubscribeReceivesEventsVerbatim(t *testing.T) {
 			return err
 		}
 		for _, e := range events {
-			if _, err := fmt.Fprintf(conn, "%s\n", e); err != nil {
+			if _, err := fmt.Fprintf(conn, "%s\n", e.raw); err != nil {
 				return err
 			}
 		}
@@ -189,8 +225,23 @@ func TestSubscribeReceivesEventsVerbatim(t *testing.T) {
 			if !ok {
 				t.Fatalf("events channel closed before event %d", i)
 			}
-			if string(got) != want {
-				t.Errorf("event %d = %s, want %s", i, got, want)
+			if got.Kind != want.kind {
+				t.Errorf("event %d Kind = %q, want %q", i, got.Kind, want.kind)
+			}
+			if got.PaneID != want.pane {
+				t.Errorf("event %d PaneID = %q, want %q", i, got.PaneID, want.pane)
+			}
+			if got.TabID != want.tab {
+				t.Errorf("event %d TabID = %q, want %q", i, got.TabID, want.tab)
+			}
+			if got.Agent != want.agent {
+				t.Errorf("event %d Agent = %q, want %q", i, got.Agent, want.agent)
+			}
+			if got.NewState != want.state {
+				t.Errorf("event %d NewState = %q, want %q", i, got.NewState, want.state)
+			}
+			if string(got.Raw) != want.raw {
+				t.Errorf("event %d Raw = %q, want %q", i, got.Raw, want.raw)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("timed out waiting for event %d", i)
@@ -199,7 +250,7 @@ func TestSubscribeReceivesEventsVerbatim(t *testing.T) {
 }
 
 func TestSubscribeDropsAck(t *testing.T) {
-	const ev = `{"type":"pane.created","pane_id":"w1:p1","workspace_id":"w1"}`
+	const ev = `{"data":{"pane_id":"w1:p1","type":"pane_created","workspace_id":"w1"},"event":"pane_created"}`
 
 	sock, _ := startStubServer(t, func(r *bufio.Reader, conn net.Conn) error {
 		if _, err := readSubscribeFrame(r); err != nil {
@@ -223,8 +274,8 @@ func TestSubscribeDropsAck(t *testing.T) {
 		if !ok {
 			t.Fatal("events channel closed before the real event")
 		}
-		if string(got) != ev {
-			t.Errorf("event = %s, want %s", got, ev)
+		if got.Kind != KindPaneCreated || got.PaneID != "w1:p1" {
+			t.Errorf("event = %+v, want pane.created for w1:p1", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for event after ack")
@@ -241,7 +292,7 @@ func TestSubscribeDropsAck(t *testing.T) {
 }
 
 func TestSubscribeSkipsMalformed(t *testing.T) {
-	const ev = `{"type":"pane.closed","pane_id":"w1:p1","workspace_id":"w1"}`
+	const ev = `{"data":{"pane_id":"w1:p1","type":"pane_closed","workspace_id":"w1"},"event":"pane_closed"}`
 
 	sock, _ := startStubServer(t, func(r *bufio.Reader, conn net.Conn) error {
 		if _, err := readSubscribeFrame(r); err != nil {
@@ -266,8 +317,8 @@ func TestSubscribeSkipsMalformed(t *testing.T) {
 		if !ok {
 			t.Fatal("events channel closed before the real event")
 		}
-		if string(got) != ev {
-			t.Errorf("event = %s, want %s", got, ev)
+		if got.Kind != KindPaneClosed || got.PaneID != "w1:p1" {
+			t.Errorf("event = %+v, want pane.closed for w1:p1", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for event after malformed frames")
@@ -338,29 +389,45 @@ func TestSubscribeCloseIdempotent(t *testing.T) {
 	}
 }
 
-func TestClassify(t *testing.T) {
-	event := json.RawMessage(`{"type":"pane.created","pane_id":"w1:p1"}`)
-	if got := classify(event); got != frameEvent {
-		t.Errorf("classify(event) = %v, want frameEvent", got)
+func TestParseFrame(t *testing.T) {
+	event := json.RawMessage(`{"data":{"pane":{"pane_id":"w1:p1","workspace_id":"w1","tab_id":"w1:t1"},"type":"pane_created"},"event":"pane_created"}`)
+	kind, ev, err := parseFrame(event)
+	if err != nil {
+		t.Fatalf("parseFrame(event): %v", err)
+	}
+	if kind != frameEvent {
+		t.Errorf("kind = %v, want frameEvent", kind)
+	}
+	if ev.Kind != KindPaneCreated || ev.PaneID != "w1:p1" {
+		t.Errorf("ev = %+v, want pane.created for w1:p1", ev)
 	}
 
 	ack := json.RawMessage(`{"id":"herdr-scribe","result":{"ok":true}}`)
-	if got := classify(ack); got != frameAck {
-		t.Errorf("classify(ack) = %v, want frameAck", got)
+	if kind, _, err := parseFrame(ack); err != nil || kind != frameAck {
+		t.Errorf("parseFrame(ack) = (%v, %v), want (frameAck, nil)", kind, err)
 	}
 
 	errResp := json.RawMessage(`{"id":"herdr-scribe","error":{"code":"MethodNotFound","message":"nope"}}`)
-	if got := classify(errResp); got != frameAck {
-		t.Errorf("classify(error response) = %v, want frameAck", got)
+	if kind, _, err := parseFrame(errResp); err != nil || kind != frameAck {
+		t.Errorf("parseFrame(error response) = (%v, %v), want (frameAck, nil)", kind, err)
+	}
+
+	unknownType := json.RawMessage(`{"data":{"pane_id":"w1:p1"},"event":"pane.scroll_changed"}`)
+	kind, _, err = parseFrame(unknownType)
+	if kind != frameEvent {
+		t.Errorf("kind = %v, want frameEvent", kind)
+	}
+	if err == nil {
+		t.Error("parseFrame(unknown type): expected error")
 	}
 
 	unknown := json.RawMessage(`{"unrelated":1}`)
-	if got := classify(unknown); got != frameUnknown {
-		t.Errorf("classify(unknown) = %v, want frameUnknown", got)
+	if kind, _, err := parseFrame(unknown); err != nil || kind != frameUnknown {
+		t.Errorf("parseFrame(unknown) = (%v, %v), want (frameUnknown, nil)", kind, err)
 	}
 
 	garbage := json.RawMessage(`not json`)
-	if got := classify(garbage); got != frameUnknown {
-		t.Errorf("classify(garbage) = %v, want frameUnknown", got)
+	if kind, _, err := parseFrame(garbage); err == nil || kind != frameUnknown {
+		t.Errorf("parseFrame(garbage) = (%v, %v), want (frameUnknown, error)", kind, err)
 	}
 }

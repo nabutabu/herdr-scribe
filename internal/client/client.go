@@ -55,5 +55,9 @@ func Call(ctx context.Context, method string, params map[string]any) (json.RawMe
 }
 
 func Dial() (net.Conn, error) {
-	return net.Dial("unix", SocketPath())
+	path := SocketPath()
+	if path == "" {
+		return nil, fmt.Errorf("HERDR_SOCKET_PATH environment variable is not set")
+	}
+	return net.Dial("unix", path)
 }

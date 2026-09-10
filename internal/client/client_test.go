@@ -54,7 +54,7 @@ func TestWriteFrame(t *testing.T) {
 	}
 
 	var parsed Request
-	if err := json.Unmarshal(trimNewline(got), &parsed); err != nil {
+	if err := json.Unmarshal(TrimNewline(got), &parsed); err != nil {
 		t.Fatalf("unmarshal frame: %v", err)
 	}
 	if parsed.ID != "herdr-scribe" || parsed.Method != "ping" {
@@ -112,7 +112,7 @@ func TestCallPing(t *testing.T) {
 			return err
 		}
 		var req Request
-		if err := json.Unmarshal(trimNewline(line), &req); err != nil {
+		if err := json.Unmarshal(TrimNewline(line), &req); err != nil {
 			return fmt.Errorf("parsing request: %w", err)
 		}
 		if req.ID != "herdr-scribe" || req.Method != "ping" {

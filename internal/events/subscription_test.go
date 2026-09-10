@@ -23,15 +23,15 @@ func TestBuildParamsGlobalEvents(t *testing.T) {
 	params := BuildParams(nil)
 
 	subs := params["subscriptions"].([]Subscription)
-	wantGlobal := []string{
-		EventWorkspaceCreated,
-		EventWorkspaceClosed,
-		EventPaneCreated,
-		EventPaneClosed,
-		EventPaneAgentDetected,
+	wantGlobal := []SubscriptionType{
+		SubscribeWorkspaceCreated,
+		SubscribeWorkspaceClosed,
+		SubscribePaneCreated,
+		SubscribePaneClosed,
+		SubscribePaneAgentDetected,
 	}
 
-	seen := make(map[string]int)
+	seen := make(map[SubscriptionType]int)
 	for _, s := range subs {
 		seen[s.Type]++
 	}
@@ -52,7 +52,7 @@ func TestBuildParamsPaneScoped(t *testing.T) {
 	subs := params["subscriptions"].([]Subscription)
 	var scoped []Subscription
 	for _, s := range subs {
-		if s.Type == EventPaneAgentStatusChanged {
+		if s.Type == SubscribePaneAgentStatusChanged {
 			scoped = append(scoped, s)
 		}
 	}
@@ -74,7 +74,7 @@ func TestBuildParamsNoPanesSkipsScoped(t *testing.T) {
 
 	subs := params["subscriptions"].([]Subscription)
 	for _, s := range subs {
-		if s.Type == EventPaneAgentStatusChanged {
+		if s.Type == SubscribePaneAgentStatusChanged {
 			t.Errorf("unexpected agent_status_changed subscription: %+v", s)
 		}
 		if s.PaneID != "" {

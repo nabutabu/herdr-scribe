@@ -36,11 +36,14 @@ func main() {
 
 	for {
 		select {
-		case _, ok := <-sub.Events():
+		case ev, ok := <-sub.Events():
 			if !ok {
 				slog.Info("subscription stream ended")
 				return
 			}
+
+			slog.Info("Parsed Event", "event", ev)
+
 		case err := <-sub.Err():
 			if err != nil {
 				slog.Error("subscription error", "error", err)
