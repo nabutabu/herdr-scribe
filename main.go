@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,7 +10,6 @@ import (
 
 	"github.com/nabutabu/herdr-scribe/internal/client"
 	"github.com/nabutabu/herdr-scribe/internal/events"
-	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 )
 
 const maxInitialAttempts = 5
@@ -75,7 +73,7 @@ func main() {
 func subscribeWithBackoff(maxAttempts int) (*events.Subscriber, bool) {
 	for attempt := 1; maxAttempts == 0 || attempt <= maxAttempts; attempt++ {
 		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		s, ok := TryConnectWithSessionSnapshot(cctx)
+		s, ok := events.SubscribeFromSnapshot(cctx)
 		cancel()
 		if ok {
 			return s, true
@@ -88,31 +86,4 @@ func subscribeWithBackoff(maxAttempts int) (*events.Subscriber, bool) {
 		time.Sleep(backoff)
 	}
 	return nil, false
-}
-
-func TryConnectWithSessionSnapshot(ctx context.Context) (*events.Subscriber, bool) {
-	raw, err := client.Call(ctx, "session.snapshot", map[string]any{})
-	if err != nil {
-		slog.Error("session reconnect failed", "error", err)
-		return nil, false
-	}
-
-	var resp snapshot.Response
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		slog.Error("parsing session snapshot", "error", err, "raw", string(raw))
-		return nil, false
-	}
-
-	paneIDs := make([]string, 0, len(resp.Snapshot.Panes))
-	for _, pane := range resp.Snapshot.Panes {
-		paneIDs = append(paneIDs, pane.PaneID)
-	}
-	slog.Info("resubscribing from snapshot", "pane_count", len(paneIDs), "pane_ids", paneIDs)
-
-	sub, err := events.NewSubscriber(events.BuildParams(paneIDs))
-	if err != nil {
-		slog.Error("resubscribe failed", "error", err)
-		return nil, false
-	}
-	return sub, true
 }

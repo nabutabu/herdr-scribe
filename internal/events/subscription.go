@@ -1,5 +1,14 @@
 package events
 
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+
+	"github.com/nabutabu/herdr-scribe/internal/client"
+	"github.com/nabutabu/herdr-scribe/internal/snapshot"
+)
+
 // SubscriptionType is the event name Herdr accepts in an events.subscribe
 // request (dotted form, e.g. "pane.created"), distinct from the underscore
 // wire name pushed back on the event stream.
@@ -32,4 +41,34 @@ func BuildParams(paneIDs []string) map[string]any {
 	}
 
 	return map[string]any{"subscriptions": subscriptions}
+}
+
+// SubscribeFromSnapshot fetches a fresh session.snapshot and establishes a
+// subscription scoped to the panes it finds. Returns the new Subscriber and
+// true on success; nil and false on any failure (caller owns Close()).
+func SubscribeFromSnapshot(ctx context.Context) (*Subscriber, bool) {
+	raw, err := client.Call(ctx, "session.snapshot", map[string]any{})
+	if err != nil {
+		slog.Error("session snapshot failed", "error", err)
+		return nil, false
+	}
+
+	var resp snapshot.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		slog.Error("parsing session snapshot", "error", err, "raw", string(raw))
+		return nil, false
+	}
+
+	paneIDs := make([]string, 0, len(resp.Snapshot.Panes))
+	for _, pane := range resp.Snapshot.Panes {
+		paneIDs = append(paneIDs, pane.PaneID)
+	}
+	slog.Info("subscribing from session snapshot", "pane_count", len(paneIDs), "pane_ids", paneIDs)
+
+	sub, err := NewSubscriber(BuildParams(paneIDs))
+	if err != nil {
+		slog.Error("subscribe failed", "error", err)
+		return nil, false
+	}
+	return sub, true
 }
