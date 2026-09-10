@@ -37,7 +37,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	sigError := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGABRT, syscall.SIGPIPE)
+	signal.Notify(sigError, syscall.SIGABRT, syscall.SIGPIPE)
 
 	for {
 		select {
