@@ -1,5 +1,13 @@
 package snapshot
 
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/nabutabu/herdr-scribe/internal/client"
+)
+
 type Response struct {
 	Type     string   `json:"type"`
 	Snapshot Snapshot `json:"snapshot"`
@@ -12,8 +20,36 @@ type Snapshot struct {
 	FocusedTabID       *string     `json:"focused_tab_id"`
 	FocusedPaneID      *string     `json:"focused_pane_id"`
 	Workspaces         []Workspace `json:"workspaces"`
+	Tabs               []Tab       `json:"tabs"`
 	Panes              []Pane      `json:"panes"`
 	Agents             []Agent     `json:"agents"`
+}
+
+// Tab mirrors the tabs[] collection of session.snapshot. Tabs carry no
+// lifecycle events in the subscription (0.2), so this collection is only ever
+// learned via snapshot fetches.
+type Tab struct {
+	TabID       string      `json:"tab_id"`
+	WorkspaceID string      `json:"workspace_id"`
+	Label       string      `json:"label"`
+	Number      uint        `json:"number"`
+	Focused     bool        `json:"focused"`
+	PaneCount   uint        `json:"pane_count"`
+	AgentStatus AgentStatus `json:"agent_status"`
+}
+
+func (Response) Fetch(ctx context.Context) (Response, error) {
+	raw, err := client.Call(ctx, "session.snapshot", map[string]any{})
+	if err != nil {
+		return Response{}, fmt.Errorf("session snapshot: %w", err)
+	}
+
+	var resp Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return Response{}, fmt.Errorf("parsing session snapshot %q: %w", string(raw), err)
+	}
+
+	return resp, nil
 }
 
 type AgentStatus string

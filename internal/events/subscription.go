@@ -2,10 +2,8 @@ package events
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 
-	"github.com/nabutabu/herdr-scribe/internal/client"
 	"github.com/nabutabu/herdr-scribe/internal/snapshot"
 )
 
@@ -43,20 +41,16 @@ func BuildParams(paneIDs []string) map[string]any {
 	return map[string]any{"subscriptions": subscriptions}
 }
 
-// SubscribeFromSnapshot fetches a fresh session.snapshot and establishes a
-// subscription scoped to the panes it finds. Returns the new Subscriber and
-// true on success; nil and false on any failure (caller owns Close()).
-func SubscribeFromSnapshot(ctx context.Context) (*Subscriber, bool) {
-	raw, err := client.Call(ctx, "session.snapshot", map[string]any{})
+// SubscribeFromSnapshot fetches a fresh session.snapshot (returned to the
+// caller for tracking the bootstrap baseline) and establishes a subscription
+// scoped to the panes it finds. Returns the new Subscriber and true on
+// success; nil and false on any failure (caller owns Close()).
+func SubscribeFromSnapshot(ctx context.Context) (*Subscriber, snapshot.Response, bool) {
+	var resp snapshot.Response
+	resp, err := resp.Fetch(ctx)
 	if err != nil {
 		slog.Error("session snapshot failed", "error", err)
-		return nil, false
-	}
-
-	var resp snapshot.Response
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		slog.Error("parsing session snapshot", "error", err, "raw", string(raw))
-		return nil, false
+		return nil, snapshot.Response{}, false
 	}
 
 	paneIDs := make([]string, 0, len(resp.Snapshot.Panes))
@@ -68,7 +62,7 @@ func SubscribeFromSnapshot(ctx context.Context) (*Subscriber, bool) {
 	sub, err := NewSubscriber(BuildParams(paneIDs))
 	if err != nil {
 		slog.Error("subscribe failed", "error", err)
-		return nil, false
+		return nil, snapshot.Response{}, false
 	}
-	return sub, true
+	return sub, resp, true
 }
