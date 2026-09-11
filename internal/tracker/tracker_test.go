@@ -125,6 +125,236 @@ func TestApplyAgentStatusChangedIgnoresSameState(t *testing.T) {
 	}
 }
 
+func TestApplyAgentStatusChangedClosesAttentionLatency(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	if ag := tr.agents["w1:p1"]; ag.AttentionStartedAt != cur {
+		t.Fatalf("entering done did not start clock: AttentionStartedAt=%v", ag.AttentionStartedAt)
+	}
+
+	cur = cur.Add(7 * time.Minute)
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.Duration != 7*time.Minute {
+			t.Errorf("attention latency = %s, want 7m", al.Duration)
+		}
+		if al.PaneID != "w1:p1" || al.Agent != "codex" || al.WorkspaceID != "w1" {
+			t.Errorf("latency metadata = %+v", al)
+		}
+	default:
+		t.Fatal("no attention latency emitted on leaving done")
+	}
+}
+
+func TestApplyAgentStatusChangedDoneDuplicateDoesNotReArmClock(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	change := func(s snapshot.AgentStatus) {
+		tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s})
+	}
+
+	change(snapshot.AgentStatusDone) // opens done at t0
+	cur = cur.Add(time.Minute)
+	change(snapshot.AgentStatusDone) // duplicate: must not re-open the clock
+	cur = cur.Add(2 * time.Minute)
+	change(snapshot.AgentStatusBlocked) // closes done: 3m, not 2m
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.Duration != 3*time.Minute {
+			t.Errorf("attention latency = %s, want 3m (duplicate must not re-arm)", al.Duration)
+		}
+	default:
+		t.Fatal("no attention latency emitted on leaving done")
+	}
+}
+
+func TestApplySnapshotPreservesAttentionIntervalAcrossRebaseline(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	agent := "codex"
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: agent, NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(10 * time.Minute)
+
+	// Re-baseline with the pane still done (e.g. resubscribe for an unrelated
+	// drift): the running attention clock must survive, not reset to now.
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusDone, Agent: &agent}},
+	})
+
+	ag := tr.agents["w1:p1"]
+	if ag.Status != snapshot.AgentStatusDone || ag.AttentionStartedAt != cur.Add(-10*time.Minute) {
+		t.Fatalf("agent state after re-baseline = %+v (clock must be preserved)", ag)
+	}
+
+	cur = cur.Add(5 * time.Minute)
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: agent, NewState: snapshot.AgentStatusIdle})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.Duration != 15*time.Minute {
+			t.Errorf("attention latency = %s, want 15m (10m pre-rebaseline + 5m post)", al.Duration)
+		}
+	default:
+		t.Fatal("no attention latency emitted after cross-rebaseline close")
+	}
+}
+
+func TestApplySnapshotReseedsChangedStatus(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	agent := "codex"
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: agent, NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(10 * time.Minute)
+
+	// Snapshot reports working: genuine change we missed -> fresh floor at now.
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusWorking, Agent: &agent}},
+	})
+
+	ag := tr.agents["w1:p1"]
+	if ag.Status != snapshot.AgentStatusWorking || ag.StateEnteredAt != cur {
+		t.Fatalf("agent state after changed-status re-baseline = %+v (want fresh floor)", ag)
+	}
+}
+
+func TestDiffClassifiesSeenFlipAsBenign(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+
+	// Tracked done + snapshot idle = silent seen-flip, not a resubscribe-worthy drift.
+	report := tr.Diff(snapshot.Snapshot{Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusIdle}}})
+	if report.Drifted() {
+		t.Errorf("seen-flip must not count as drift: %+v", report.Drifts)
+	}
+	if len(report.SeenFlips) != 1 || report.SeenFlips[0].PaneID != "w1:p1" {
+		t.Errorf("seen flips = %+v, want one for w1:p1", report.SeenFlips)
+	}
+
+	// Tracked done + snapshot working = real gap (agent resumed, event missed) -> drift.
+	report = tr.Diff(snapshot.Snapshot{Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusWorking}}})
+	if !report.Drifted() {
+		t.Fatal("done vs working must count as drift")
+	}
+	if len(report.SeenFlips) != 0 {
+		t.Errorf("done vs working must not be a seen-flip: %+v", report.SeenFlips)
+	}
+}
+
+func TestApplySeenFlipClosesAttentionLatency(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(4 * time.Minute)
+
+	tr.ApplySeenFlip("w1:p1")
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.Duration != 4*time.Minute {
+			t.Errorf("attention latency = %s, want 4m", al.Duration)
+		}
+	default:
+		t.Fatal("no attention latency emitted on seen-flip")
+	}
+
+	ag := tr.agents["w1:p1"]
+	if ag.Status != snapshot.AgentStatusIdle || !ag.AttentionStartedAt.IsZero() {
+		t.Errorf("agent after seen-flip = %+v, want idle with zero clock", ag)
+	}
+	if d := ag.DurationByState[snapshot.AgentStatusDone]; d != 4*time.Minute {
+		t.Errorf("closed done duration = %s, want 4m", d)
+	}
+	if pane := tr.panes["w1:p1"]; pane.Status != snapshot.AgentStatusIdle {
+		t.Errorf("pane after seen-flip status = %q, want idle", pane.Status)
+	}
+
+	// The fold must be idempotent for the next reconcile tick: nothing to close now.
+	cur = cur.Add(time.Minute)
+	tr.ApplySeenFlip("w1:p1")
+	select {
+	case al := <-tr.AttentionLatency():
+		t.Errorf("second seen-flip emitted another sample: %+v", al)
+	default:
+	}
+}
+
+func TestApplySeenFlipIsNoopWhenAgentLeftDone(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(2 * time.Minute)
+	// The real resume event raced the reconcile diff and already closed done.
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+	<-tr.AttentionLatency() // drain the real close
+
+	cur = cur.Add(time.Minute)
+	tr.ApplySeenFlip("w1:p1")
+
+	select {
+	case al := <-tr.AttentionLatency():
+		t.Errorf("seen-flip after real close emitted a stale sample: %+v", al)
+	default:
+	}
+	if ag := tr.agents["w1:p1"]; ag.Status != snapshot.AgentStatusWorking {
+		t.Errorf("agent status = %q, want working (seen-flip must not overwrite)", ag.Status)
+	}
+}
+
+func TestApplyPaneClosedFlushesDoneInterval(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusDone})
+	cur = cur.Add(3 * time.Minute)
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		if al.Duration != 3*time.Minute {
+			t.Errorf("flushed attention latency = %s, want 3m", al.Duration)
+		}
+	default:
+		t.Fatal("no attention latency emitted on pane close while done")
+	}
+
+	tr.mu.RLock()
+	_, agentGone := tr.agents["w1:p1"]
+	_, paneGone := tr.panes["w1:p1"]
+	tr.mu.RUnlock()
+	if agentGone || paneGone {
+		t.Error("pane/agent not removed after close")
+	}
+}
+
+func TestApplyPaneClosedForeignNoLatency(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
+
+	select {
+	case al := <-tr.AttentionLatency():
+		t.Errorf("closing a non-done pane emitted a sample: %+v", al)
+	default:
+	}
+}
+
 func TestApplySnapshotSeedsAndResetsAgents(t *testing.T) {
 	agent := "codex"
 	tr := NewTracker()
@@ -377,12 +607,12 @@ func TestRunCallsOnDrift(t *testing.T) {
 	defer cancel()
 
 	fired := make(chan struct{}, 1)
-	go tr.Run(ctx, 20*time.Millisecond, func() { fired <- struct{}{} })
+	go tr.Run(ctx, 20*time.Millisecond, func(DiffReport) { fired <- struct{}{} })
 
 	select {
 	case <-fired:
 	case <-time.After(2 * time.Second):
-		t.Fatal("onDrift not called despite drift")
+		t.Fatal("onReport not called despite drift")
 	}
 }
 
@@ -398,11 +628,11 @@ func TestRunSilentWhenInSync(t *testing.T) {
 	defer cancel()
 
 	called := make(chan struct{}, 1)
-	go tr.Run(ctx, 20*time.Millisecond, func() { called <- struct{}{} })
+	go tr.Run(ctx, 20*time.Millisecond, func(DiffReport) { called <- struct{}{} })
 
 	select {
 	case <-called:
-		t.Fatal("onDrift called despite matching state")
+		t.Fatal("onReport called despite matching state")
 	case <-time.After(200 * time.Millisecond):
 	}
 }
@@ -429,7 +659,7 @@ func TestRunSurvivesFetchError(t *testing.T) {
 	defer cancel()
 
 	fired := make(chan struct{}, 1)
-	go tr.Run(ctx, 20*time.Millisecond, func() { fired <- struct{}{} })
+	go tr.Run(ctx, 20*time.Millisecond, func(DiffReport) { fired <- struct{}{} })
 
 	select {
 	case <-fired:
@@ -451,7 +681,7 @@ func TestRunsStopsOnCancel(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		tr.Run(ctx, 20*time.Millisecond, func() {})
+		tr.Run(ctx, 20*time.Millisecond, func(DiffReport) {})
 		close(done)
 	}()
 

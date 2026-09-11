@@ -55,19 +55,43 @@ type AgentState struct {
 	AttentionStartedAt time.Time
 }
 
+// AttentionLatency is emitted when an agent leaves `done` — the elapsed time
+// between entering done and being "seen". Phase 3 (3.5) wires this to an OTel
+// histogram; this layer only computes and surfaces it.
+//
+// Wire fact (herdr src/app/api.rs emit_pane_state_update): entering `done`
+// (working/blocked completion to idle while the pane is unseen) pushes a
+// pane.agent_status_changed event, but leaving `done` by merely being *seen*
+// (focus/navigation flips pane.seen, herdr src/app/actions.rs
+// mark_active_tab_seen) emits nothing at all — the status only reverts to
+// idle in session.snapshot. So there are two close paths: a real status
+// change event (resume), and a reconcile-detected done→idle seen-flip.
+type AttentionLatency struct {
+	PaneID      string
+	WorkspaceID string
+	Agent       string
+	Duration    time.Duration
+	ObservedAt  time.Time
+}
+
 // Tracker holds the live picture of the session as currently known. Steady
 // state is event-driven — the app's dispatcher calls the per-kind Apply*
 // methods; the bootstrap snapshot is folded in once via ApplySnapshot. It is
 // never adopted from a snapshot after that — Run's reconcile step only diffs
-// and signals, it never mutates, so that diffing has an independent truth to
-// compare against (0.4: events carry no sequence number and the stream can
-// silently stall).
+// and signals (reports drifts AND seen-flips to app.Run), it never mutates, so
+// that diffing has an independent truth to compare against (0.4: events carry
+// no sequence number and the stream can silently stall).
 type Tracker struct {
 	mu         sync.RWMutex
 	workspaces map[string]WorkspaceState
 	tabs       map[string]TabState
 	panes      map[string]PaneState
 	agents     map[string]AgentState
+
+	// attentionLatency surfaces closed done-intervals. Non-blocking send with
+	// drop-and-warn on backpressure, matching Subscriber's events channel
+	// idiom.
+	attentionLatency chan AttentionLatency
 
 	// now is the clock used by the Apply* methods for duration math. Defaults
 	// to time.Now; tests substitute a fake to make duration assertions
@@ -77,11 +101,25 @@ type Tracker struct {
 
 func NewTracker() *Tracker {
 	return &Tracker{
-		workspaces: map[string]WorkspaceState{},
-		tabs:       map[string]TabState{},
-		panes:      map[string]PaneState{},
-		agents:     map[string]AgentState{},
-		now:        time.Now,
+		workspaces:       map[string]WorkspaceState{},
+		tabs:             map[string]TabState{},
+		panes:            map[string]PaneState{},
+		agents:           map[string]AgentState{},
+		attentionLatency: make(chan AttentionLatency, 64),
+		now:              time.Now,
+	}
+}
+
+// AttentionLatency delivers closed attention-latency intervals as they are
+// observed (2.4). Phase 3.5 consumes this channel; the app currently just
+// logs from it.
+func (t *Tracker) AttentionLatency() <-chan AttentionLatency { return t.attentionLatency }
+
+func (t *Tracker) emitAttentionLatency(al AttentionLatency) {
+	select {
+	case t.attentionLatency <- al:
+	default:
+		slog.Warn("attention latency channel full; dropping", "pane_id", al.PaneID, "agent", al.Agent)
 	}
 }
 
@@ -126,10 +164,23 @@ func (t *Tracker) ApplyPaneCreated(ev events.NormalizedEvent) {
 	}
 }
 
-// ApplyPaneClosed removes a pane.
+// ApplyPaneClosed removes a pane. If its agent was still `done`, the
+// attention-latency interval is flushed rather than silently dropped — the
+// pane may close while unseen (2.7's flush-on-close).
 func (t *Tracker) ApplyPaneClosed(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	now := t.now()
+	if ag, ok := t.agents[ev.PaneID]; ok && ag.Status == snapshot.AgentStatusDone {
+		t.emitAttentionLatency(AttentionLatency{
+			PaneID:      ag.PaneID,
+			WorkspaceID: ag.WorkspaceID,
+			Agent:       ag.AgentType,
+			Duration:    now.Sub(ag.AttentionStartedAt),
+			ObservedAt:  now,
+		})
+	}
+	delete(t.agents, ev.PaneID)
 	delete(t.panes, ev.PaneID)
 }
 
@@ -145,8 +196,10 @@ func (t *Tracker) ApplyAgentDetected(ev events.NormalizedEvent) {
 
 // ApplyAgentStatusChanged updates the pane and, for the pane's agent, closes
 // out the duration of the previous state and opens the new one (2.3). Same
-// state re-applied is a no-op (idempotency seam, 2.5). Attention-latency
-// tracking for `done` (2.4) is deliberately not wired here.
+// state re-applied is a no-op (idempotency seam, 2.5). Entering `done` starts
+// the attention-latency clock; leaving it (via a status change event — the
+// event path; the silent seen path is ApplySeenFlip) emits the closed
+// interval (2.4).
 func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -168,7 +221,7 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 		if tabID == "" {
 			tabID = pane.TabID
 		}
-		t.agents[ev.PaneID] = AgentState{
+		state := AgentState{
 			PaneID:          ev.PaneID,
 			WorkspaceID:     ev.WorkspaceID,
 			TabID:           tabID,
@@ -177,6 +230,10 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 			StateEnteredAt:  now,
 			DurationByState: map[snapshot.AgentStatus]time.Duration{},
 		}
+		if ev.NewState == snapshot.AgentStatusDone {
+			state.AttentionStartedAt = now
+		}
+		t.agents[ev.PaneID] = state
 		return
 	}
 
@@ -184,24 +241,92 @@ func (t *Tracker) ApplyAgentStatusChanged(ev events.NormalizedEvent) {
 		return
 	}
 
-	ag.DurationByState[ag.Status] += now.Sub(ag.StateEnteredAt)
+	prevStatus := ag.Status
+	ag.DurationByState[prevStatus] += now.Sub(ag.StateEnteredAt)
 	ag.Status = ev.NewState
 	ag.StateEnteredAt = now
 	ag.WorkspaceID = ev.WorkspaceID
 	if ev.Agent != "" {
 		ag.AgentType = ev.Agent
 	}
+
+	if ev.NewState == snapshot.AgentStatusDone {
+		// Entering done starts the attention-latency clock. The same-state
+		// guard above means a duplicate done event can never re-open it.
+		ag.AttentionStartedAt = now
+	} else if prevStatus == snapshot.AgentStatusDone {
+		t.emitAttentionLatency(AttentionLatency{
+			PaneID:      ag.PaneID,
+			WorkspaceID: ag.WorkspaceID,
+			Agent:       ag.AgentType,
+			Duration:    now.Sub(ag.AttentionStartedAt),
+			ObservedAt:  now,
+		})
+		ag.AttentionStartedAt = time.Time{}
+	}
 	t.agents[ev.PaneID] = ag
+}
+
+// ApplySeenFlip closes out a reconcile-detected done→idle transition: the
+// silent "user looked at it" case, where herdr flips pane.seen with no event
+// and only the next session.snapshot shows idle. It is a no-op when the agent
+// is no longer tracked as `done` — a real status-changed event may have raced
+// the reconcile diff and already closed the interval via
+// ApplyAgentStatusChanged.
+func (t *Tracker) ApplySeenFlip(paneID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+
+	ag, ok := t.agents[paneID]
+	if !ok || ag.Status != snapshot.AgentStatusDone {
+		return
+	}
+
+	ag.DurationByState[ag.Status] += now.Sub(ag.StateEnteredAt)
+	t.emitAttentionLatency(AttentionLatency{
+		PaneID:      ag.PaneID,
+		WorkspaceID: ag.WorkspaceID,
+		Agent:       ag.AgentType,
+		Duration:    now.Sub(ag.AttentionStartedAt),
+		ObservedAt:  now,
+	})
+	ag.Status = snapshot.AgentStatusIdle
+	ag.StateEnteredAt = now
+	ag.AttentionStartedAt = time.Time{}
+	t.agents[paneID] = ag
+
+	if pane, ok := t.panes[paneID]; ok {
+		pane.Status = snapshot.AgentStatusIdle
+		pane.UpdatedAt = now
+		t.panes[paneID] = pane
+	}
 }
 
 // ApplySnapshot folds a full session.snapshot into the tracked state. Used as
 // the one-shot baseline on startup and again after a reconnect re-bootstrap,
 // when the event stream may have a gap. After this, the stream owns the state
 // until the next re-bootstrap.
+//
+// A re-baseline must not restart clocks for agents whose status is unchanged:
+// a pane sitting in `done` across a resubscribe (which can be triggered by an
+// unrelated drift) would otherwise truncate its attention-latency interval to
+// the time since re-baseline (Reconcile is primary, not a backstop). For such
+// agents carry the prior tracking forward; only new-to-us or changed-status
+// agents seed at `now` — a conservative floor that undercounts rather than
+// fabricates. This also stops 2.3's cumulative per-state durations from being
+// wiped on every drift-triggered resubscribe.
 func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
+
+	// Copy, don't alias: clear(t.agents) below would otherwise empty this
+	// snapshot too (maps are reference types).
+	prevAgents := make(map[string]AgentState, len(t.agents))
+	for k, v := range t.agents {
+		prevAgents[k] = v
+	}
 
 	clear(t.workspaces)
 	clear(t.tabs)
@@ -224,7 +349,7 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 		// Seed an agent record so post-bootstrap transitions have a prior
 		// state to close out a duration against.
 		if pane.Agent != nil {
-			t.agents[pane.PaneID] = AgentState{
+			seed := AgentState{
 				PaneID:          pane.PaneID,
 				WorkspaceID:     pane.WorkspaceID,
 				TabID:           pane.TabID,
@@ -233,6 +358,14 @@ func (t *Tracker) ApplySnapshot(snap snapshot.Snapshot) {
 				StateEnteredAt:  now,
 				DurationByState: map[snapshot.AgentStatus]time.Duration{},
 			}
+			if prev, ok := prevAgents[pane.PaneID]; ok && prev.Status == pane.AgentStatus {
+				seed.StateEnteredAt = prev.StateEnteredAt
+				seed.DurationByState = prev.DurationByState
+				seed.AttentionStartedAt = prev.AttentionStartedAt
+			} else if pane.AgentStatus == snapshot.AgentStatusDone {
+				seed.AttentionStartedAt = now
+			}
+			t.agents[pane.PaneID] = seed
 		}
 	}
 }
@@ -245,11 +378,26 @@ type Drift struct {
 	Actual  string // "" when absent from the snapshot
 }
 
+// SeenFlip is a pane whose tracked status was `done` but the fresh snapshot
+// reports `idle` — the silent "the user looked at it" transition (2.4). Herdr
+// pushes no event for it: pane.seen is flipped by focus/navigation without a
+// PaneStateUpdate (herdr src/app/actions.rs mark_active_tab_seen), so the
+// status only reverts to idle inside session.snapshot. Reconciliation is the
+// sole detector. Unlike a Drift, a SeenFlip is benign — it must not tear down
+// a healthy subscription.
+type SeenFlip struct {
+	PaneID      string
+	WorkspaceID string
+}
+
 type DiffReport struct {
-	Drifts []Drift
+	Drifts    []Drift
+	SeenFlips []SeenFlip
 }
 
 func (r DiffReport) Drifted() bool { return len(r.Drifts) > 0 }
+
+func (r DiffReport) Empty() bool { return len(r.Drifts) == 0 && len(r.SeenFlips) == 0 }
 
 // Diff compares tracked state against a fresh snapshot without mutating.
 // Workspaces and panes participate; tabs deliberately do not — events can
@@ -260,6 +408,7 @@ func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 	defer t.mu.RUnlock()
 
 	var drifts []Drift
+	var flips []SeenFlip
 
 	for id := range t.workspaces {
 		if !hasWorkspace(snap.Workspaces, id) {
@@ -283,6 +432,13 @@ func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 			drifts = append(drifts, Drift{Kind: "pane", ID: id, Tracked: describePaneTracked(pane)})
 			continue
 		}
+		// Tracked done + snapshot idle is the silent seen-flip, not a drift:
+		// the stream is healthy, the user just looked. Any other mismatch is
+		// a genuine missing-event gap -> resubscribe.
+		if pane.Status == snapshot.AgentStatusDone && sp.AgentStatus == snapshot.AgentStatusIdle {
+			flips = append(flips, SeenFlip{PaneID: id, WorkspaceID: sp.WorkspaceID})
+			continue
+		}
 		tracked := describePaneTracked(pane)
 		actual := describePaneSnapshot(sp)
 		if tracked != actual {
@@ -295,14 +451,17 @@ func (t *Tracker) Diff(snap snapshot.Snapshot) DiffReport {
 		}
 	}
 
-	return DiffReport{Drifts: drifts}
+	return DiffReport{Drifts: drifts, SeenFlips: flips}
 }
 
 // Run owns the periodic liveness check (1.8). It opens a fresh short-lived
 // session.snapshot connection each interval, diffs it against the tracked
-// state, and calls onDrift when they disagree — the sole signal for forcing a
-// subscription re-create. Run never mutates tracker state.
-func (t *Tracker) Run(ctx context.Context, interval time.Duration, onDrift func()) {
+// state, and calls onReport with the result when anything disagrees — either a
+// genuine drift (the sole signal for forcing a subscription re-create) or a
+// benign seen-flip (2.4). Run never mutates tracker state: applying a
+// seen-flip is App.Run's job via ApplySeenFlip, so the single-writer rule
+// holds.
+func (t *Tracker) Run(ctx context.Context, interval time.Duration, onReport func(DiffReport)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -310,7 +469,7 @@ func (t *Tracker) Run(ctx context.Context, interval time.Duration, onDrift func(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			t.reconcile(ctx, onDrift)
+			t.reconcile(ctx, onReport)
 		}
 	}
 }
@@ -318,7 +477,7 @@ func (t *Tracker) Run(ctx context.Context, interval time.Duration, onDrift func(
 // reconcile performs one liveness probe. A fetch failure is logged and skipped
 // — that is the loud-failure path owned by the subscriber's reconnect logic,
 // not this check (0.4: this loop exists for the silent failure mode).
-func (t *Tracker) reconcile(ctx context.Context, onDrift func()) {
+func (t *Tracker) reconcile(ctx context.Context, onReport func(DiffReport)) {
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	resp, err := snapshot.Fetch(tctx)
 	cancel()
@@ -328,13 +487,16 @@ func (t *Tracker) reconcile(ctx context.Context, onDrift func()) {
 	}
 
 	report := t.Diff(resp.Snapshot)
-	if !report.Drifted() {
+	if report.Empty() {
 		return
 	}
 	for _, d := range report.Drifts {
 		slog.Warn("reconcile: state drift", "kind", d.Kind, "id", d.ID, "tracked", d.Tracked, "actual", d.Actual)
 	}
-	onDrift()
+	for _, sf := range report.SeenFlips {
+		slog.Info("reconcile: done pane seen via snapshot", "pane_id", sf.PaneID)
+	}
+	onReport(report)
 }
 
 func hasWorkspace(ws []snapshot.Workspace, id string) bool {

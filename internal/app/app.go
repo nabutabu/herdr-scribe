@@ -45,17 +45,27 @@ func (a *App) Run(ctx context.Context) error {
 	a.tr = tracker.NewTracker()
 	a.tr.ApplySnapshot(resp.Snapshot)
 
-	// Drift detected by the tracker's reconciliation loop is the only path that
-	// tears down and re-creates the subscription. The loop goroutine never
-	// touches `sub`; it only signals here so ownership stays with Run.
+	// Reconciled diffs reach this callback (still running on the loop
+	// goroutine). It never touches `sub` — subscription teardown stays owned by
+	// Run's event loop. A report carries either genuine drift (the only signal
+	// that tears down and re-creates the subscription) or a benign done→idle
+	// seen-flip (2.4), whose application is App.Run's job per the single-writer
+	// rule — applied here, before any same-tick resubscribe is signalled, so a
+	// re-baseline can't eat a just-closed attention-latency interval.
 	resubscribe := make(chan struct{}, 1)
-	onDrift := func() {
+	onReport := func(report tracker.DiffReport) {
+		for _, sf := range report.SeenFlips {
+			a.tr.ApplySeenFlip(sf.PaneID)
+		}
+		if !report.Drifted() {
+			return
+		}
 		select {
 		case resubscribe <- struct{}{}:
 		default:
 		}
 	}
-	go a.tr.Run(ctx, time.Minute, onDrift)
+	go a.tr.Run(ctx, time.Minute, onReport)
 
 	slog.Info("subscribed; open/close a pane or drive an agent to see events (Ctrl-C to stop)")
 
@@ -75,6 +85,10 @@ func (a *App) Run(ctx context.Context) error {
 				slog.Error("subscription error", "error", err)
 			}
 			a.reconnect(ctx)
+
+		case al := <-a.tr.AttentionLatency():
+			// Phase 3.5 replaces this log with an OTel histogram emission.
+			slog.Info("attention latency", "pane_id", al.PaneID, "agent", al.Agent, "duration", al.Duration)
 
 		case <-resubscribe:
 			// Silent-stream guard (0.4): the socket is healthy but the event
