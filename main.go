@@ -53,9 +53,6 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	sigError := make(chan os.Signal, 1)
-	signal.Notify(sigError, syscall.SIGABRT, syscall.SIGPIPE)
-
 	for {
 		select {
 		case ev, ok := <-sub.Events():
@@ -79,9 +76,6 @@ func main() {
 		case <-sig:
 			slog.Info("shutting down")
 			return
-		case <-sigError:
-			slog.Debug("Error signal. Trying reconnect...")
-			reconnect(tr, sub, &sub)
 		}
 	}
 }

@@ -156,7 +156,7 @@ func TestFetch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp, err := (Response{}).Fetch(ctx)
+	resp, err := Fetch(ctx)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestFetchUnmarshalError(t *testing.T) {
 	})
 	t.Setenv("HERDR_SOCKET_PATH", sock)
 
-	if _, err := (Response{}).Fetch(context.Background()); err == nil {
+	if _, err := Fetch(context.Background()); err == nil {
 		t.Fatal("expected error for malformed response")
 	}
 }

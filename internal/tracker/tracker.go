@@ -222,7 +222,7 @@ func (t *Tracker) Run(ctx context.Context, interval time.Duration, onDrift func(
 // not this check (0.4: this loop exists for the silent failure mode).
 func (t *Tracker) reconcile(ctx context.Context, onDrift func()) {
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	resp, err := (snapshot.Response{}).Fetch(tctx)
+	resp, err := snapshot.Fetch(tctx)
 	cancel()
 	if err != nil {
 		slog.Warn("reconcile: session.snapshot failed", "error", err)

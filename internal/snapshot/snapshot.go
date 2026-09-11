@@ -38,7 +38,7 @@ type Tab struct {
 	AgentStatus AgentStatus `json:"agent_status"`
 }
 
-func (Response) Fetch(ctx context.Context) (Response, error) {
+func Fetch(ctx context.Context) (Response, error) {
 	raw, err := client.Call(ctx, "session.snapshot", map[string]any{})
 	if err != nil {
 		return Response{}, fmt.Errorf("session snapshot: %w", err)

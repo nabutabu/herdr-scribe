@@ -46,8 +46,7 @@ func BuildParams(paneIDs []string) map[string]any {
 // scoped to the panes it finds. Returns the new Subscriber and true on
 // success; nil and false on any failure (caller owns Close()).
 func SubscribeFromSnapshot(ctx context.Context) (*Subscriber, snapshot.Response, bool) {
-	var resp snapshot.Response
-	resp, err := resp.Fetch(ctx)
+	resp, err := snapshot.Fetch(ctx)
 	if err != nil {
 		slog.Error("session snapshot failed", "error", err)
 		return nil, snapshot.Response{}, false
