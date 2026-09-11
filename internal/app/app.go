@@ -18,7 +18,7 @@ import (
 const maxInitialAttempts = 5
 
 // App owns the subscription lifecycle. A single Tracker is shared between the
-// event loop (ApplyEvent) and the reconciliation watchdog (Run's diffing).
+// event loop (handleEvent) and the reconciliation watchdog (Run's diffing).
 type App struct {
 	sub *events.Subscriber
 	tr  *tracker.Tracker
@@ -67,7 +67,7 @@ func (a *App) Run(ctx context.Context) error {
 				return nil
 			}
 
-			a.tr.ApplyEvent(ev)
+			a.handleEvent(ev)
 			slog.Info("Parsed Event", "event", ev)
 
 		case err := <-a.sub.Err():
@@ -85,6 +85,29 @@ func (a *App) Run(ctx context.Context) error {
 			slog.Info("shutting down")
 			return nil
 		}
+	}
+}
+
+// handleEvent routes a normalized event to the tracker handler for its kind.
+// It is called synchronously from Run's event loop — never in its own
+// goroutine — so the tracker's state stays single-writer. An unknown kind is
+// protocol drift (0.2): log and skip rather than panic the process.
+func (a *App) handleEvent(ev events.NormalizedEvent) {
+	switch ev.Kind {
+	case events.KindWorkspaceCreated:
+		a.tr.ApplyWorkspaceCreated(ev)
+	case events.KindWorkspaceClosed:
+		a.tr.ApplyWorkspaceClosed(ev)
+	case events.KindPaneCreated:
+		a.tr.ApplyPaneCreated(ev)
+	case events.KindPaneClosed:
+		a.tr.ApplyPaneClosed(ev)
+	case events.KindAgentDetected:
+		a.tr.ApplyAgentDetected(ev)
+	case events.KindAgentStatusChanged:
+		a.tr.ApplyAgentStatusChanged(ev)
+	default:
+		slog.Warn("unhandled event kind; skipping", "kind", ev.Kind)
 	}
 }
 

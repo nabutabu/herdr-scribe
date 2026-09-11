@@ -27,12 +27,12 @@ func workingPanes(agent string) []snapshot.Pane {
 	return []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusWorking}}
 }
 
-func TestApplyEventTracksState(t *testing.T) {
+func TestApplyEventsTrackState(t *testing.T) {
 	tr := NewTracker()
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindWorkspaceCreated, WorkspaceID: "w1"})
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindPaneCreated, PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindAgentDetected, PaneID: "w1:p1", Agent: "codex"})
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
+	tr.ApplyWorkspaceCreated(events.NormalizedEvent{WorkspaceID: "w1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyAgentDetected(events.NormalizedEvent{PaneID: "w1:p1", Agent: "codex"})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", Agent: "codex", NewState: snapshot.AgentStatusWorking})
 
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
@@ -52,9 +52,9 @@ func TestApplyEventTracksState(t *testing.T) {
 	}
 }
 
-func TestApplyEventStatusChangeUpsertsUnknownPane(t *testing.T) {
+func TestApplyAgentStatusChangedUpsertsUnknownPane(t *testing.T) {
 	tr := NewTracker()
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusBlocked})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: snapshot.AgentStatusBlocked})
 
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
@@ -68,11 +68,99 @@ func TestApplyEventStatusChangeUpsertsUnknownPane(t *testing.T) {
 	}
 }
 
-func TestApplyEventWorkspaceClosedCascades(t *testing.T) {
+func TestApplyAgentStatusChangedTracksDurations(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	tr := NewTracker()
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindWorkspaceCreated, WorkspaceID: "w1"})
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindPaneCreated, PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindWorkspaceClosed, WorkspaceID: "w1"})
+	tr.now = func() time.Time { return cur }
+
+	change := func(s snapshot.AgentStatus) {
+		tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s})
+	}
+
+	change(snapshot.AgentStatusWorking) // opens working at t0
+	cur = cur.Add(2 * time.Minute)
+	change(snapshot.AgentStatusBlocked) // closes working: 2m
+	cur = cur.Add(3 * time.Minute)
+	change(snapshot.AgentStatusWorking) // closes blocked: 3m
+
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+
+	ag, ok := tr.agents["w1:p1"]
+	if !ok {
+		t.Fatal("agent w1:p1 not tracked")
+	}
+	if ag.Status != snapshot.AgentStatusWorking {
+		t.Errorf("agent status = %q, want working", ag.Status)
+	}
+	if d := ag.DurationByState[snapshot.AgentStatusWorking]; d != 2*time.Minute {
+		t.Errorf("working duration = %s, want 2m", d)
+	}
+	if d := ag.DurationByState[snapshot.AgentStatusBlocked]; d != 3*time.Minute {
+		t.Errorf("blocked duration = %s, want 3m", d)
+	}
+}
+
+func TestApplyAgentStatusChangedIgnoresSameState(t *testing.T) {
+	cur := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	tr := NewTracker()
+	tr.now = func() time.Time { return cur }
+
+	change := func(s snapshot.AgentStatus) {
+		tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "codex", NewState: s})
+	}
+
+	change(snapshot.AgentStatusWorking) // opens working at t0
+	cur = cur.Add(time.Minute)
+	change(snapshot.AgentStatusWorking) // duplicate: must not reset the clock
+	cur = cur.Add(time.Minute)
+	change(snapshot.AgentStatusBlocked) // closes working: 2m, not 1m
+
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+
+	ag := tr.agents["w1:p1"]
+	if d := ag.DurationByState[snapshot.AgentStatusWorking]; d != 2*time.Minute {
+		t.Errorf("working duration = %s, want 2m (duplicate must not double-count or reset)", d)
+	}
+}
+
+func TestApplySnapshotSeedsAndResetsAgents(t *testing.T) {
+	agent := "codex"
+	tr := NewTracker()
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusWorking, Agent: &agent}},
+	})
+
+	tr.mu.RLock()
+	ag, ok := tr.agents["w1:p1"]
+	tr.mu.RUnlock()
+	if !ok {
+		t.Fatal("agent w1:p1 not seeded from snapshot")
+	}
+	if ag.Status != snapshot.AgentStatusWorking || ag.AgentType != "codex" {
+		t.Errorf("seeded agent = %+v", ag)
+	}
+	if ag.StateEnteredAt.IsZero() {
+		t.Error("seeded agent has zero StateEnteredAt")
+	}
+
+	// A later snapshot with no agents must reset the agents map.
+	tr.ApplySnapshot(snapshot.Snapshot{
+		Panes: []snapshot.Pane{{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentStatus: snapshot.AgentStatusIdle}},
+	})
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if _, ok := tr.agents["w1:p1"]; ok {
+		t.Error("agents map not reset on snapshot re-apply")
+	}
+}
+
+func TestApplyWorkspaceClosedCascades(t *testing.T) {
+	tr := NewTracker()
+	tr.ApplyWorkspaceCreated(events.NormalizedEvent{WorkspaceID: "w1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyWorkspaceClosed(events.NormalizedEvent{WorkspaceID: "w1"})
 
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
@@ -121,9 +209,9 @@ func TestDiffNoDrift(t *testing.T) {
 	}
 
 	tr := NewTracker()
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindWorkspaceCreated, WorkspaceID: "w1"})
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindPaneCreated, PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", Agent: "", NewState: snapshot.AgentStatusWorking})
+	tr.ApplyWorkspaceCreated(events.NormalizedEvent{WorkspaceID: "w1"})
+	tr.ApplyPaneCreated(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1"})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", Agent: "", NewState: snapshot.AgentStatusWorking})
 
 	if report := tr.Diff(snap); report.Drifted() {
 		t.Fatalf("unexpected drift: %+v", report.Drifts)
@@ -139,7 +227,7 @@ func TestDiffDetectsStatusChange(t *testing.T) {
 	tr := NewTracker()
 	tr.ApplySnapshot(snap)
 	// Event stream says blocked; snapshot says working -> drift.
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindAgentStatusChanged, PaneID: "w1:p1", WorkspaceID: "w1", NewState: snapshot.AgentStatusBlocked})
+	tr.ApplyAgentStatusChanged(events.NormalizedEvent{PaneID: "w1:p1", WorkspaceID: "w1", NewState: snapshot.AgentStatusBlocked})
 
 	report := tr.Diff(snap)
 	if !report.Drifted() {
@@ -184,7 +272,7 @@ func TestDiffDetectsRemovedPane(t *testing.T) {
 	tr := NewTracker()
 	tr.ApplySnapshot(snap)
 	// Pane closed in the stream, but the snapshot still lists it -> drift.
-	tr.ApplyEvent(events.NormalizedEvent{Kind: events.KindPaneClosed, PaneID: "w1:p1"})
+	tr.ApplyPaneClosed(events.NormalizedEvent{PaneID: "w1:p1"})
 
 	report := tr.Diff(snap)
 	if !report.Drifted() {
